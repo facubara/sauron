@@ -153,6 +153,47 @@ def lm_visibility(landmark):
     return v if v is not None else 0.0
 
 
+# HUD control regions (x1, y1, x2, y2) for 640px-wide frame
+_CTRL_MUTE = (465, 10, 545, 35)
+_CTRL_CAM = (555, 10, 630, 35)
+_CTRL_VOL = (465, 42, 630, 56)
+
+
+def _draw_controls(frame, controls):
+    """Draw mute, camera, and volume controls on the HUD."""
+    mx1, my1, mx2, my2 = _CTRL_MUTE
+    cx1, cy1, cx2, cy2 = _CTRL_CAM
+    vx1, vy1, vx2, vy2 = _CTRL_VOL
+
+    # Mute button
+    mute_bg = (0, 0, 160) if controls["muted"] else (50, 50, 50)
+    cv2.rectangle(frame, (mx1, my1), (mx2, my2), mute_bg, -1)
+    cv2.rectangle(frame, (mx1, my1), (mx2, my2), (150, 150, 150), 1)
+    mute_label = "MUTED" if controls["muted"] else "MUTE"
+    cv2.putText(frame, mute_label, (mx1 + 12, my2 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+    # Camera button
+    cam_bg = (0, 0, 160) if controls["camera_off"] else (50, 50, 50)
+    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), cam_bg, -1)
+    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (150, 150, 150), 1)
+    cam_label = "CAM OFF" if controls["camera_off"] else "CAM"
+    cv2.putText(frame, cam_label, (cx1 + 5, cy2 - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
+    # Volume slider
+    vol_fill_x = int(vx1 + (vx2 - vx1) * controls["volume"])
+    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (40, 40, 40), -1)
+    cv2.rectangle(frame, (vx1, vy1), (vol_fill_x, vy2), (0, 160, 0), -1)
+    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (150, 150, 150), 1)
+    knob_y = (vy1 + vy2) // 2
+    cv2.circle(frame, (vol_fill_x, knob_y), 8, (220, 220, 220), -1)
+    cv2.circle(frame, (vol_fill_x, knob_y), 8, (150, 150, 150), 1)
+    vol_pct = int(controls["volume"] * 100)
+    cv2.putText(frame, f"VOL {vol_pct}%", (vx1, vy2 + 14),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -196,6 +237,9 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    # Give the camera time to initialize before reading frames
+    time.sleep(1.0)
+
     # Create OpenCV window and set its icon via Win32 API
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
     try:
@@ -219,6 +263,44 @@ def main():
 
     popup = WarningPopup()
 
+    controls = {
+        "muted": False,
+        "camera_off": False,
+        "volume": 0.5,
+        "dragging_volume": False,
+    }
+    pygame.mixer.music.set_volume(controls["volume"])
+
+    def on_mouse(event, x, y, flags, param):
+        ctrl = param
+        mx1, my1, mx2, my2 = _CTRL_MUTE
+        cx1, cy1, cx2, cy2 = _CTRL_CAM
+        vx1, vy1, vx2, vy2 = _CTRL_VOL
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            if mx1 <= x <= mx2 and my1 <= y <= my2:
+                ctrl["muted"] = not ctrl["muted"]
+                pygame.mixer.music.set_volume(
+                    0.0 if ctrl["muted"] else ctrl["volume"])
+            elif cx1 <= x <= cx2 and cy1 <= y <= cy2:
+                ctrl["camera_off"] = not ctrl["camera_off"]
+            elif vx1 <= x <= vx2 and vy1 - 5 <= y <= vy2 + 5:
+                ctrl["dragging_volume"] = True
+                ctrl["volume"] = max(0.0, min(1.0,
+                                              (x - vx1) / (vx2 - vx1)))
+                if not ctrl["muted"]:
+                    pygame.mixer.music.set_volume(ctrl["volume"])
+        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
+            if ctrl["dragging_volume"]:
+                ctrl["volume"] = max(0.0, min(1.0,
+                                              (x - vx1) / (vx2 - vx1)))
+                if not ctrl["muted"]:
+                    pygame.mixer.music.set_volume(ctrl["volume"])
+        elif event == cv2.EVENT_LBUTTONUP:
+            ctrl["dragging_volume"] = False
+
+    cv2.setMouseCallback(WINDOW_TITLE, on_mouse, controls)
+
     bite_frames = 0
     BITE_THRESHOLD_FRAMES = 6
     cooldown_until = 0
@@ -241,10 +323,23 @@ def main():
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
-                break
+                if cv2.waitKey(30) & 0xFF == ord("q"):
+                    break
+                continue
 
             frame = cv2.flip(frame, 1)
             h, w, _ = frame.shape
+
+            # Camera off: show black frame with controls only
+            if controls["camera_off"]:
+                frame[:] = 0
+                cv2.putText(frame, "CAMERA OFF", (w // 2 - 115, h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
+                _draw_controls(frame, controls)
+                cv2.imshow(WINDOW_TITLE, frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+                continue
 
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -440,7 +535,8 @@ def main():
             if bite_frames >= BITE_THRESHOLD_FRAMES:
                 bite_frames = 0
                 cooldown_until = now + 5
-                play_warning()
+                if not controls["muted"]:
+                    play_warning()
                 popup.show(duration=2.5)
                 print(f"  >>> ALERT! method={detection_method} hand={side}"
                       f" dist={min_d:.0f} thr={threshold:.0f}")
@@ -488,6 +584,7 @@ def main():
                 cv2.putText(frame, f"Dist: {min_d:.0f}px", (180, y_info),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, d_color, 1)
 
+            _draw_controls(frame, controls)
             cv2.imshow(WINDOW_TITLE, frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
