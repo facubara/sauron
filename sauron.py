@@ -23,6 +23,8 @@ import sys
 import random
 import pygame
 import ctypes
+import json
+from datetime import date
 
 BaseOptions = mp.tasks.BaseOptions
 PoseLandmarker = mp.tasks.vision.PoseLandmarker
@@ -38,6 +40,33 @@ SCRIPT_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__))
 ICON_PATH = os.path.join(SCRIPT_DIR, "sauron-icon.ico")
 WINDOW_TITLE = "Sauron - Nail Bite Detector"
 
+# Writable user-data dir (APPDATA is read-write; SCRIPT_DIR is _MEIPASS in PyInstaller builds)
+USER_DATA_DIR = os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "Sauron")
+STATS_PATH = os.path.join(USER_DATA_DIR, "stats.json")
+
+
+def load_today_count():
+    """Return today's violation count, resetting if the stored date is stale."""
+    today = date.today().isoformat()
+    try:
+        with open(STATS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") == today:
+            return int(data.get("count", 0))
+    except (OSError, ValueError, KeyError):
+        pass
+    return 0
+
+
+def save_today_count(count):
+    try:
+        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        with open(STATS_PATH, "w", encoding="utf-8") as f:
+            json.dump({"date": date.today().isoformat(), "count": count}, f)
+    except OSError:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Audio
@@ -51,10 +80,18 @@ pygame.mixer.init()
 
 
 def play_warning():
+    """Start looping a warning sound. Keeps playing until stop_warning()."""
     try:
         sound_file = random.choice(WARNING_SOUNDS)
         pygame.mixer.music.load(sound_file)
-        pygame.mixer.music.play()
+        pygame.mixer.music.play(loops=-1)
+    except Exception:
+        pass
+
+
+def stop_warning():
+    try:
+        pygame.mixer.music.stop()
     except Exception:
         pass
 
@@ -63,19 +100,32 @@ def play_warning():
 # Popup
 # ---------------------------------------------------------------------------
 class WarningPopup:
+    """Fullscreen alert that stays visible until hide() is called.
+
+    Runs Tk in its own thread; hide() is thread-safe.
+    """
+
     def __init__(self):
         self._visible = False
         self._root = None
         self._thread = None
 
-    def show(self, duration=2.5):
+    def show(self):
         if self._visible:
             return
         self._visible = True
-        self._thread = threading.Thread(target=self._run, args=(duration,), daemon=True)
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _run(self, duration):
+    def hide(self):
+        root = self._root
+        if root is not None:
+            try:
+                root.after(0, self._close)
+            except Exception:
+                pass
+
+    def _run(self):
         root = tk.Tk()
         self._root = root
         root.attributes("-fullscreen", True)
@@ -95,9 +145,6 @@ class WarningPopup:
         tk.Label(frame, text="Hands away from your mouth.",
                  font=("Segoe UI", 24), fg="#ff9999", bg="#1a0000").pack()
 
-        root.after(int(duration * 1000), self._close)
-        root.bind("<Button-1>", lambda e: self._close())
-        root.bind("<Escape>", lambda e: self._close())
         root.mainloop()
 
     def _close(self):
@@ -302,10 +349,17 @@ def main():
     cv2.setMouseCallback(WINDOW_TITLE, on_mouse, controls)
 
     bite_frames = 0
+    clear_frames = 0
     BITE_THRESHOLD_FRAMES = 6
-    cooldown_until = 0
+    CLEAR_THRESHOLD_FRAMES = 15  # ~0.5s of clean frames before dismissing
+    alert_active = False
+    alert_started_at = 0.0
+    MIN_ALERT_SECONDS = 0.6      # don't flicker on brief false clears
     last_log = 0
     frame_count = 0
+
+    violation_count = load_today_count()
+    current_day = date.today().isoformat()
 
     # Wrist trajectory tracking (for "approaching mouth then lost" detection)
     prev_wrist_dist = {"L": None, "R": None}   # previous distance to mouth
@@ -332,6 +386,10 @@ def main():
 
             # Camera off: show black frame with controls only
             if controls["camera_off"]:
+                if alert_active:
+                    alert_active = False
+                    popup.hide()
+                    stop_warning()
                 frame[:] = 0
                 cv2.putText(frame, "CAMERA OFF", (w // 2 - 115, h // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
@@ -527,19 +585,45 @@ def main():
                            (0, 0, 255) if detected else (80, 80, 80), 1)
 
             # ----- Consecutive-frame logic -----
-            if detected and now > cooldown_until:
-                bite_frames += 1
+            if detected:
+                bite_frames = min(bite_frames + 1, BITE_THRESHOLD_FRAMES)
+                clear_frames = 0
             else:
                 bite_frames = max(0, bite_frames - 1)
+                clear_frames += 1
 
-            if bite_frames >= BITE_THRESHOLD_FRAMES:
-                bite_frames = 0
-                cooldown_until = now + 5
+            # Trigger: sustained detection while no alert is active
+            if not alert_active and bite_frames >= BITE_THRESHOLD_FRAMES:
+                alert_active = True
+                alert_started_at = now
+                # Roll over counter if day changed mid-session
+                today = date.today().isoformat()
+                if today != current_day:
+                    current_day = today
+                    violation_count = 0
+                violation_count += 1
+                save_today_count(violation_count)
+                popup.show()
                 if not controls["muted"]:
                     play_warning()
-                popup.show(duration=2.5)
-                print(f"  >>> ALERT! method={detection_method} hand={side}"
-                      f" dist={min_d:.0f} thr={threshold:.0f}")
+                print(f"  >>> ALERT #{violation_count}! method={detection_method}"
+                      f" hand={side} dist={min_d:.0f} thr={threshold:.0f}")
+
+            # Release: sustained clean frames AND minimum display time met
+            if (alert_active
+                    and clear_frames >= CLEAR_THRESHOLD_FRAMES
+                    and now - alert_started_at >= MIN_ALERT_SECONDS):
+                alert_active = False
+                popup.hide()
+                stop_warning()
+                print(f"  <<< CLEAR ({clear_frames} clean frames)")
+
+            # If user toggles mute while alert is active, stop/start sound
+            if alert_active:
+                if controls["muted"] and pygame.mixer.music.get_busy():
+                    stop_warning()
+                elif not controls["muted"] and not pygame.mixer.music.get_busy():
+                    play_warning()
 
             # ----- Console log (every 0.5s) -----
             if now - last_log > 0.5:
@@ -568,6 +652,11 @@ def main():
             cv2.rectangle(frame, (10, 45), (10 + bar_w, 60), color, -1)
             cv2.rectangle(frame, (10, 45), (210, 60), (100, 100, 100), 1)
 
+            # Daily violation counter
+            counter_color = (0, 0, 255) if violation_count > 0 else (150, 150, 150)
+            cv2.putText(frame, f"BITES TODAY: {violation_count}", (225, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, counter_color, 2)
+
             # Detection source indicators
             y_info = h - 15
             if has_face:
@@ -589,6 +678,8 @@ def main():
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
     finally:
+        popup.hide()
+        stop_warning()
         pose_landmarker.close()
         hand_landmarker.close()
         face_landmarker.close()
