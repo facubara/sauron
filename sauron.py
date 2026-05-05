@@ -99,23 +99,80 @@ def stop_warning():
 # ---------------------------------------------------------------------------
 # Popup
 # ---------------------------------------------------------------------------
-class WarningPopup:
-    """Fullscreen alert that stays visible until hide() is called.
+# Hardcoded fallback if phrases.txt is missing or empty.
+# ASCII letters + space + period + comma only — no apostrophes, no question
+# marks, no accents. Reachable on any standard keyboard layout without dead
+# keys or AltGr combos.
+DEFAULT_PHRASES = [
+    "Not all those who wander are lost.",
+    "You shall not pass.",
+    "All we have to decide is what to do with the time that is given us.",
+    "Many that live deserve death. And some that die deserve life.",
+    "Even the very wise cannot see all ends.",
+    "Speak friend and enter.",
+]
 
-    Runs Tk in its own thread; hide() is thread-safe.
+
+def load_phrases():
+    """Load phrases from disk. Tries user override first, then bundled
+    default, then falls back to DEFAULT_PHRASES.
+
+    File format: one phrase per line. Blank lines and lines starting with
+    '#' are ignored.
+    """
+    candidates = [
+        os.path.join(USER_DATA_DIR, "phrases.txt"),  # user-editable override
+        os.path.join(SCRIPT_DIR, "phrases.txt"),     # bundled default
+    ]
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                lines = [ln.strip() for ln in f]
+        except OSError:
+            continue
+        phrases = [ln for ln in lines if ln and not ln.startswith("#")]
+        if phrases:
+            return phrases
+    return list(DEFAULT_PHRASES)
+
+
+LOTR_PHRASES = load_phrases()
+
+
+class WarningPopup:
+    """Fullscreen alert with a typing challenge that must be completed
+    before the alert can dismiss.
+
+    Runs Tk in its own thread; hide() and challenge_passed() are thread-safe.
     """
 
     def __init__(self):
         self._visible = False
         self._root = None
         self._thread = None
+        self._target = ""
+        self._typed = ""
+        self._cursor = 0
+        self._challenge_passed = threading.Event()
+        self._phrase_widget = None
+        self._typed_widget = None
+        self._cursor_visible = True
 
     def show(self):
         if self._visible:
             return
         self._visible = True
+        # Fresh phrase + reset state for this alert
+        self._target = random.choice(LOTR_PHRASES)
+        self._typed = ""
+        self._cursor = 0
+        self._challenge_passed.clear()
+        self._cursor_visible = True
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def challenge_passed(self) -> bool:
+        return self._challenge_passed.is_set()
 
     def hide(self):
         root = self._root
@@ -130,7 +187,7 @@ class WarningPopup:
         self._root = root
         root.attributes("-fullscreen", True)
         root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.82)
+        root.attributes("-alpha", 0.92)
         root.configure(bg="#1a0000")
         root.overrideredirect(True)
         try:
@@ -140,14 +197,182 @@ class WarningPopup:
 
         frame = tk.Frame(root, bg="#1a0000")
         frame.place(relx=0.5, rely=0.5, anchor="center")
+
         tk.Label(frame, text="STOP BITING YOUR NAILS!",
-                 font=("Segoe UI", 54, "bold"), fg="#ff3333", bg="#1a0000").pack(pady=(0, 10))
-        tk.Label(frame, text="Hands away from your mouth.",
-                 font=("Segoe UI", 24), fg="#ff9999", bg="#1a0000").pack()
+                 font=("Segoe UI", 54, "bold"), fg="#ff3333",
+                 bg="#1a0000").pack(pady=(0, 10))
+        tk.Label(frame, text="Type the phrase to dismiss:",
+                 font=("Segoe UI", 22), fg="#ff9999",
+                 bg="#1a0000").pack(pady=(0, 24))
+
+        # Phrase display — Text widget with tags for per-character coloring
+        phrase = tk.Text(frame, font=("Consolas", 26, "bold"),
+                         bg="#1a0000", fg="#ff9999",
+                         bd=0, highlightthickness=0, wrap="word",
+                         height=4, width=48, cursor="arrow",
+                         padx=20, pady=10)
+        phrase.tag_configure("correct", foreground="#66ff66",
+                             background="#1a3a1a")
+        phrase.tag_configure("cursor_on", foreground="#ffff66",
+                             background="#3a2a00", underline=True)
+        phrase.tag_configure("cursor_off", foreground="#ffff66",
+                             background="#3a2a00")
+        phrase.tag_configure("flash", foreground="#ffffff",
+                             background="#aa0000")
+        phrase.tag_configure("done", foreground="#88ff88",
+                             background="#1a4a1a")
+        phrase.insert("1.0", self._target)
+        phrase.config(state="disabled")
+        phrase.pack(pady=(0, 24))
+        self._phrase_widget = phrase
+
+        # Typed mirror — shows exactly what the user has pressed (incl. mistakes)
+        mirror = tk.Text(frame, font=("Consolas", 16),
+                         bg="#0a0000", fg="#999999",
+                         bd=0, highlightthickness=0, wrap="word",
+                         height=2, width=70, cursor="arrow",
+                         padx=12, pady=6)
+        mirror.tag_configure("ok", foreground="#88ff88")
+        mirror.tag_configure("bad", foreground="#ff5555",
+                             background="#3a0000")
+        mirror.config(state="disabled")
+        mirror.pack()
+        self._typed_widget = mirror
+
+        tk.Label(frame, text="Backspace clears your typed log. Mistakes don't"
+                 " regress your progress.",
+                 font=("Segoe UI", 11, "italic"), fg="#664444",
+                 bg="#1a0000").pack(pady=(14, 0))
+
+        root.bind("<Key>", self._on_key)
+        root.bind("<FocusOut>", lambda _e: root.after(60, self._refocus))
+        root.focus_force()
+
+        self._render_phrase()
+        self._update_typed_mirror()
+        self._pulse_cursor()
 
         root.mainloop()
 
+    def _refocus(self):
+        try:
+            if self._root is not None:
+                self._root.focus_force()
+        except Exception:
+            pass
+
+    def _on_key(self, event):
+        if event.keysym == "BackSpace":
+            if self._typed:
+                self._typed = self._typed[:-1]
+                self._update_typed_mirror()
+            return
+        ch = event.char
+        if not ch or ord(ch[0]) < 32 or ord(ch[0]) == 127:
+            return
+        if self._cursor >= len(self._target):
+            return
+
+        self._typed += ch
+        expected = self._target[self._cursor]
+        if ch == expected:
+            self._cursor += 1
+            self._render_phrase()
+            if self._cursor >= len(self._target):
+                self._challenge_passed.set()
+                self._completion_flash()
+        else:
+            self._flash_mistake()
+        self._update_typed_mirror()
+
+    def _render_phrase(self):
+        widget = self._phrase_widget
+        if widget is None:
+            return
+        try:
+            widget.config(state="normal")
+            for tag in ("correct", "cursor_on", "cursor_off"):
+                widget.tag_remove(tag, "1.0", "end")
+            if self._cursor > 0:
+                widget.tag_add("correct", "1.0", f"1.{self._cursor}")
+            if self._cursor < len(self._target):
+                tag = "cursor_on" if self._cursor_visible else "cursor_off"
+                widget.tag_add(tag, f"1.{self._cursor}",
+                               f"1.{self._cursor + 1}")
+            widget.config(state="disabled")
+        except Exception:
+            pass
+
+    def _pulse_cursor(self):
+        if self._root is None:
+            return
+        self._cursor_visible = not self._cursor_visible
+        self._render_phrase()
+        try:
+            self._root.after(450, self._pulse_cursor)
+        except Exception:
+            pass
+
+    def _flash_mistake(self):
+        widget = self._phrase_widget
+        if widget is None or self._cursor >= len(self._target):
+            return
+        try:
+            widget.config(state="normal")
+            widget.tag_add("flash", f"1.{self._cursor}",
+                           f"1.{self._cursor + 1}")
+            widget.config(state="disabled")
+            self._root.after(160, self._clear_flash)
+        except Exception:
+            pass
+
+    def _clear_flash(self):
+        widget = self._phrase_widget
+        if widget is None:
+            return
+        try:
+            widget.config(state="normal")
+            widget.tag_remove("flash", "1.0", "end")
+            widget.config(state="disabled")
+        except Exception:
+            pass
+
+    def _completion_flash(self):
+        widget = self._phrase_widget
+        if widget is None:
+            return
+        try:
+            widget.config(state="normal")
+            widget.tag_remove("correct", "1.0", "end")
+            widget.tag_remove("cursor_on", "1.0", "end")
+            widget.tag_remove("cursor_off", "1.0", "end")
+            widget.tag_add("done", "1.0", "end")
+            widget.config(state="disabled")
+        except Exception:
+            pass
+
+    def _update_typed_mirror(self):
+        widget = self._typed_widget
+        if widget is None:
+            return
+        # Reconstruct the typed sequence with per-char correctness
+        try:
+            widget.config(state="normal")
+            widget.delete("1.0", "end")
+            cursor = 0
+            for ch in self._typed:
+                if cursor < len(self._target) and ch == self._target[cursor]:
+                    widget.insert("end", ch, "ok")
+                    cursor += 1
+                else:
+                    widget.insert("end", ch, "bad")
+            widget.config(state="disabled")
+        except Exception:
+            pass
+
     def _close(self):
+        self._phrase_widget = None
+        self._typed_widget = None
         if self._root:
             try:
                 self._root.destroy()
@@ -609,14 +834,15 @@ def main():
                 print(f"  >>> ALERT #{violation_count}! method={detection_method}"
                       f" hand={side} dist={min_d:.0f} thr={threshold:.0f}")
 
-            # Release: sustained clean frames AND minimum display time met
+            # Release: clean frames + min display time + typing challenge passed
             if (alert_active
                     and clear_frames >= CLEAR_THRESHOLD_FRAMES
-                    and now - alert_started_at >= MIN_ALERT_SECONDS):
+                    and now - alert_started_at >= MIN_ALERT_SECONDS
+                    and popup.challenge_passed()):
                 alert_active = False
                 popup.hide()
                 stop_warning()
-                print(f"  <<< CLEAR ({clear_frames} clean frames)")
+                print(f"  <<< CLEAR ({clear_frames} clean frames, challenge passed)")
 
             # If user toggles mute while alert is active, stop/start sound
             if alert_active:

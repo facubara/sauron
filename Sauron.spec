@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('pose_landmarker.task', '.'), ('hand_landmarker.task', '.'), ('face_landmarker.task', '.'), ('sauron-icon.ico', '.'), ('isengard.mp3', '.'), ('sauron-sound.mp3', '.')]
+datas = [('pose_landmarker.task', '.'), ('hand_landmarker.task', '.'), ('face_landmarker.task', '.'), ('sauron-icon.ico', '.'), ('isengard.mp3', '.'), ('sauron-sound.mp3', '.'), ('phrases.txt', '.')]
 binaries = []
 hiddenimports = ['mediapipe.tasks.c']
 tmp_ret = collect_all('mediapipe')

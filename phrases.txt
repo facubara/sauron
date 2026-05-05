@@ -1,0 +1,115 @@
+# Sauron typing-challenge phrases
+#
+# One phrase per line. Blank lines and lines starting with # are ignored.
+# Allowed characters: letters, spaces, period, comma. No apostrophes,
+# question marks, exclamations, or accents (those depend on keyboard
+# layout shortcuts).
+#
+# To override these without rebuilding the exe, place a copy of this file
+# at:  %APPDATA%\Sauron\phrases.txt
+# Sauron will load that one in preference to the bundled defaults.
+
+
+# ===========================================================================
+# Fellowship of the Ring — well-known quotes
+# ===========================================================================
+
+# --- Gandalf ---
+Many that live deserve death. And some that die deserve life.
+Even the very wise cannot see all ends.
+All we have to decide is what to do with the time that is given us.
+He that breaks a thing to find out what it is has left the path of wisdom.
+The wise speak only of what they know.
+Despair is only for those who see the end beyond all doubt.
+You shall not pass.
+Fly, you fools.
+
+# --- Bilbo ---
+It is a dangerous business going out of your door.
+I feel thin, sort of stretched, like butter scraped over too much bread.
+I want to see mountains again, Gandalf.
+
+# --- Frodo ---
+I will take the Ring, though I do not know the way.
+
+# --- Aragorn ---
+Not all those who wander are lost.
+
+# --- Council of Elrond ---
+Faithless is he that says farewell when the road darkens.
+Go not to the Elves for counsel, for they will say both no and yes.
+Advice is a dangerous gift, even from the wise to the wise.
+
+# --- Doors of Durin ---
+Speak friend and enter.
+
+# --- Galadriel ---
+The world is indeed full of peril, and in it there are many dark places.
+Even the smallest person can change the course of the future.
+
+# --- Hobbits ---
+Short cuts make long delays.
+Courage is found in unlikely places.
+
+# --- Atmospheric ---
+There are older and fouler things than Orcs in the deep places of the world.
+Keep it secret. Keep it safe.
+One does not simply walk into Mordor.
+
+
+# ===========================================================================
+# Sauron speaks — original messages from the Eye to the offender
+# ===========================================================================
+
+# --- The Eye watches ---
+The Eye of Sauron sees every finger that strays.
+Under the Lidless Eye, no hand goes unnoticed.
+There is no hiding from the Tower. Lower your hand.
+The Eye narrows, and yet you persist. Cease.
+From Barad dur, every gnaw is heard. Every cuticle, counted.
+The Tower watches. The fingers wait. Choose stillness.
+You cannot escape me. I am in the silence between thoughts.
+Even now, the Eye is upon you. Type, and be still.
+
+# --- The hand and the mouth ---
+The hand that bites is the hand that loses.
+A hand at the mouth is a hand at the throat of your future.
+Each nail you keep is a small victory in a long war.
+The fingertips were not given to you to be devoured.
+Ten fingers entered. May ten fingers leave.
+Place your hands where the Eye cannot tempt them.
+The fingers were not made for the molars.
+Hands in your lap, traveler. The road is long.
+
+# --- Tolkien flavored aphorisms (original) ---
+The road of restraint is paved with small refusals.
+Even the longest habit yields to the patient will.
+He that gnaws in idleness gnaws away his future.
+Wisdom is the hand kept still while the mind churns.
+To resist is to remember who you are.
+The hand obeys the mind, and the mind obeys the will.
+A clean hand is a quiet victory.
+Many have walked this road before you, and not all returned with their nails.
+
+# --- Mordor metaphors ---
+Mordor lies wherever the hand meets the mouth.
+The fires of Orodruin are kindled in small, daily betrayals.
+The Ring whispers. The cuticle whispers. Both must be cast away.
+Anxiety is the breath of the Dark Lord. Do not feed it.
+The Shadow grows long when the will grows short.
+The Nazgul ride upon idle hands. Settle them.
+
+# --- Sauronic parodies of famous lines ---
+You shall not chew.
+One does not simply gnaw into Mordor.
+Speak finger and depart.
+A wizard is never late, and a finger should be neither bitten nor chewed.
+Not all those who bite are lost. But you are getting close.
+Keep them whole. Keep them long. Keep them safe.
+
+# --- Encouragements ---
+You have come this far. Do not return to the Shadow.
+Each clean day is another step on the long road home.
+The hand that resists today is the hand that heals tomorrow.
+Even Sauron is impressed when you put your hand down.
+The eye softens, briefly, when the offender chooses stillness.
