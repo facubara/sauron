@@ -96,13 +96,17 @@ class Settings:
     # Logging level for sauron.log: DEBUG, INFO, WARNING, ERROR.
     log_level: str = "INFO"
 
+    # Download new GitHub releases and restart into them when idle.
+    auto_update: bool = True
+    update_check_hours: float = 6.0
+
     def validate(self) -> list[str]:
         """Clamp nonsensical values in place and return a list of warnings."""
         warnings: list[str] = []
         defaults = Settings()
 
         for name in ("bite_dwell_seconds", "clear_seconds", "min_alert_seconds",
-                     "eating_suppress_seconds", "snooze_minutes",
+                     "eating_suppress_seconds", "snooze_minutes", "update_check_hours",
                      "fingertip_thr_face_frac", "fingertip_thr_min_px",
                      "camera_width", "camera_height"):
             if getattr(self, name) <= 0:

@@ -8,6 +8,29 @@ and shows a clean-day streak.
 Detection runs entirely on your machine with MediaPipe hand and face
 landmarkers. Nothing leaves your computer.
 
+## Install (recommended)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install.ps1
+```
+
+This downloads the latest release to `%LOCALAPPDATA%\Programs\Sauron`,
+points the Windows startup shortcut at it and launches it. From then on
+Sauron updates itself:
+
+- Every push to `main` builds a new `Sauron.exe` on GitHub Actions and
+  publishes it as a release tagged `v0.3.<build number>`.
+- The installed app checks for a newer release a minute after start and
+  every 6 hours. It downloads and verifies the new exe in the background.
+- When no alert is active, it swaps the exe in place and restarts itself.
+  The startup shortcut keeps pointing at the same file, so every boot runs
+  the latest version.
+
+The running version is shown in the webcam window title, in the bottom
+right of the HUD, on the warning popup and in the log. Set `auto_update`
+to `false` in `config.json` to opt out. Builds made locally carry a
+`-dev` version and never update themselves.
+
 ## Quick start (from source)
 
 ```powershell
@@ -28,10 +51,8 @@ pip install -r requirements-dev.txt
 
 `Sauron.exe` is self-contained (models and sounds are bundled). It runs
 without a console; look in `%APPDATA%\Sauron\sauron.log` if something goes
-wrong. Only one instance can run at a time.
-
-To start it with Windows, put a shortcut to `Sauron.exe` in
-`shell:startup` (Win+R, type `shell:startup`).
+wrong. Only one instance can run at a time. Local builds are for testing;
+the installed copy comes from GitHub releases (see Install above).
 
 ## Controls
 
@@ -97,6 +118,8 @@ ignored, so a typo never silently disables alerts.
 | `snooze_minutes`           | 5       | Length of the `s` snooze                            |
 | `show_phrases`             | true    | Show a random line from `phrases.txt` on the popup  |
 | `log_level`                | INFO    | DEBUG adds a detector trace line every 0.5 s        |
+| `auto_update`              | true    | Install new GitHub releases automatically           |
+| `update_check_hours`       | 6       | How often to check for a new release                |
 
 Other files in `%APPDATA%\Sauron`:
 
@@ -113,8 +136,12 @@ detector.py     pure detection logic (face choice, proximity, dwell state machin
 config.py       settings file, phrases, daily stats
 alerts.py       looping sound (pygame) and fullscreen popup (tkinter)
 hud.py          OpenCV overlay and clickable controls
-tests/          pytest suite for detector.py and config.py (no camera needed)
+updater.py      self-update from GitHub releases
+version.py      build version (stamped by the release workflow)
+tests/          pytest suite (no camera, display or network needed)
 Sauron.spec     PyInstaller spec; build.ps1 drives it
+install.ps1     installs the latest release and the startup shortcut
+.github/        release workflow: test, build and publish on every push
 *.task          MediaPipe models (hand, face)
 *.mp3           warning sounds
 ```

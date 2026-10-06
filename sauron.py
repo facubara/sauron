@@ -31,6 +31,7 @@ import cv2
 import numpy as np
 
 import hud
+import updater as upd
 from alerts import AudioPlayer, WarningPopup
 from config import (
     APP_NAME,
@@ -55,8 +56,12 @@ from detector import (
     fingertip_threshold,
     select_user_face,
 )
+from version import COMMIT, VERSION
 
 log = logging.getLogger("sauron")
+
+TITLE = f"{WINDOW_TITLE}  v{VERSION}"
+UPDATED_FLAG = "--updated"  # passed to the relaunched exe after an update
 
 ICON_PATH = asset_path("sauron-icon.ico")
 WARNING_SOUNDS = [asset_path("isengard.mp3"), asset_path("sauron-sound.mp3")]
@@ -104,24 +109,46 @@ def fatal_dialog(message: str) -> None:
     print(f"ERROR: {message}", file=sys.stderr)
 
 
-def acquire_single_instance() -> bool:
+_mutex_handle = None
+
+
+def acquire_single_instance(wait_seconds: float = 0.0) -> bool:
     """Return False if another Sauron is already running (two instances
-    would fight over the webcam). The mutex is released when the process
-    exits."""
+    would fight over the webcam). After an update the old process may still
+    be shutting down, so the relaunched one waits up to wait_seconds."""
+    global _mutex_handle
     if not IS_WINDOWS:
         return True
     try:
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
         ERROR_ALREADY_EXISTS = 183
-        if not handle:
-            return True
-        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            return False
-        acquire_single_instance.handle = handle  # keep it alive
-        return True
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+            if not handle:
+                return True
+            if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
+                _mutex_handle = handle  # keep it alive for the process lifetime
+                return True
+            kernel32.CloseHandle(handle)
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.5)
     except Exception:
         return True
+
+
+def release_single_instance() -> None:
+    """Free the mutex early so a relaunched updated exe can start."""
+    global _mutex_handle
+    if IS_WINDOWS and _mutex_handle:
+        try:
+            ctypes.windll.kernel32.CloseHandle(_mutex_handle)
+        except Exception:
+            pass
+        _mutex_handle = None
 
 
 def set_window_icon(title: str, icon_path: str) -> None:
@@ -201,8 +228,28 @@ def create_landmarkers():
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
-def main(settings: Settings) -> None:
+def start_updater(settings: Settings) -> upd.Updater | None:
+    if not settings.auto_update:
+        log.info("Auto-update disabled in config.json")
+        return None
+    supported, reason = upd.updates_supported(VERSION)
+    if not supported:
+        log.info("Auto-update off: %s", reason)
+        return None
+    exe = sys.executable
+    upd.cleanup_old(exe)
+    updater = upd.Updater(VERSION, exe, settings.update_check_hours)
+    updater.start()
+    log.info("Auto-update on (every %.1f h) for %s", settings.update_check_hours, exe)
+    return updater
+
+
+def main(settings: Settings) -> bool:
+    """Run until the user quits. Returns True if an update was installed
+    and the caller should relaunch the exe."""
     mp, hand_landmarker, face_landmarker = create_landmarkers()
+    updater = start_updater(settings)
+    restart_for_update = False
 
     phrases = load_phrases() if settings.show_phrases else []
     stats = load_stats()
@@ -211,7 +258,7 @@ def main(settings: Settings) -> None:
              today_count(stats), streak_days)
 
     audio = AudioPlayer(WARNING_SOUNDS)
-    popup = WarningPopup(ICON_PATH)
+    popup = WarningPopup(ICON_PATH, version=VERSION)
     controls = hud.Controls(muted=settings.start_muted, volume=settings.volume)
     audio.set_volume(controls.effective_volume())
 
@@ -225,9 +272,9 @@ def main(settings: Settings) -> None:
             f"it? You can change camera_index in\n{USER_DATA_DIR}\\config.json")
     time.sleep(1.0)  # let the camera settle before the first read
 
-    cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
-    set_window_icon(WINDOW_TITLE, ICON_PATH)
-    cv2.setMouseCallback(WINDOW_TITLE, hud.make_mouse_callback(controls, audio.set_volume))
+    cv2.namedWindow(TITLE, cv2.WINDOW_AUTOSIZE)
+    set_window_icon(TITLE, ICON_PATH)
+    cv2.setMouseCallback(TITLE, hud.make_mouse_callback(controls, audio.set_volume))
 
     blank = np.zeros((settings.camera_height, hud.HUD_WIDTH, 3), dtype=np.uint8)
     t0 = time.monotonic()
@@ -277,6 +324,13 @@ def main(settings: Settings) -> None:
             dt = min(now - prev_t, 0.25)  # cap dt across stalls
             prev_t = now
 
+            # Install a staged update only while idle, never mid-alert.
+            if (updater is not None and updater.ready
+                    and not machine.alert_active and machine.bite_time == 0.0):
+                if updater.apply():
+                    restart_for_update = True
+                    break
+
             # ---------------- Camera off: release the device ----------------
             if controls.camera_off:
                 if cap is not None:
@@ -287,9 +341,9 @@ def main(settings: Settings) -> None:
                     log.info("Camera released")
                 frame = blank.copy()
                 hud.draw_camera_off(frame, controls)
-                cv2.imshow(WINDOW_TITLE, frame)
+                cv2.imshow(TITLE, frame)
                 handle_key(cv2.waitKey(100) & 0xFF, now)
-                if window_closed(WINDOW_TITLE):
+                if window_closed(TITLE):
                     break
                 continue
 
@@ -311,9 +365,9 @@ def main(settings: Settings) -> None:
                 cv2.putText(frame, "NO CAMERA SIGNAL", (190, 240), hud.FONT, 0.8,
                             (100, 100, 100), 2)
                 hud.draw_controls(frame, controls)
-                cv2.imshow(WINDOW_TITLE, frame)
+                cv2.imshow(TITLE, frame)
                 handle_key(cv2.waitKey(30) & 0xFF, now)
-                if window_closed(WINDOW_TITLE):
+                if window_closed(TITLE):
                     break
                 continue
             failed_reads = 0
@@ -337,9 +391,9 @@ def main(settings: Settings) -> None:
                 if detect_errors <= 5 or detect_errors % 100 == 0:
                     log.warning("Detection error #%d (skipping frame): %s",
                                 detect_errors, exc)
-                cv2.imshow(WINDOW_TITLE, frame)
+                cv2.imshow(TITLE, frame)
                 handle_key(cv2.waitKey(1) & 0xFF, now)
-                if window_closed(WINDOW_TITLE):
+                if window_closed(TITLE):
                     break
                 continue
 
@@ -418,13 +472,17 @@ def main(settings: Settings) -> None:
                 face_seen=face is not None, hand_seen=bool(hands),
                 min_dist=prox.min_dist, engaged=machine.engaged,
                 snooze_remaining=controls.snooze_remaining(now))
+            hud.draw_version(frame, VERSION,
+                             updater.new_version if updater and updater.ready else "")
             hud.draw_controls(frame, controls)
-            cv2.imshow(WINDOW_TITLE, frame)
+            cv2.imshow(TITLE, frame)
 
             handle_key(cv2.waitKey(1) & 0xFF, now)
-            if window_closed(WINDOW_TITLE):
+            if window_closed(TITLE):
                 break
     finally:
+        if updater is not None:
+            updater.stop()
         popup.hide()
         audio.stop()
         for closer in (hand_landmarker.close, face_landmarker.close):
@@ -440,6 +498,7 @@ def main(settings: Settings) -> None:
         cv2.destroyAllWindows()
 
     log.info("Sauron has closed its eye.")
+    return restart_for_update
 
 
 def run() -> int:
@@ -447,15 +506,21 @@ def run() -> int:
     setup_logging(settings.log_level)
     for warning in warnings:
         log.warning("config.json: %s", warning)
-    log.info("Starting %s (python %s, frozen=%s)", APP_NAME,
-             sys.version.split()[0], bool(getattr(sys, "frozen", False)))
+    just_updated = UPDATED_FLAG in sys.argv[1:]
+    log.info("Starting %s v%s%s (python %s, frozen=%s)%s", APP_NAME, VERSION,
+             f" [{COMMIT[:7]}]" if COMMIT else "", sys.version.split()[0],
+             bool(getattr(sys, "frozen", False)),
+             " after update" if just_updated else "")
 
-    if not acquire_single_instance():
+    if not acquire_single_instance(wait_seconds=30.0 if just_updated else 0.0):
         fatal_dialog("Sauron is already running. Look for its webcam window "
                      "(it may be minimised).")
         return 1
     try:
-        main(settings)
+        if main(settings):
+            release_single_instance()
+            upd.relaunch(sys.executable, [UPDATED_FLAG])
+            log.info("Relaunched updated exe")
         return 0
     except Exception as exc:
         log.error("Fatal error:\n%s", traceback.format_exc())

@@ -168,6 +168,19 @@ def draw_status(frame, *, status: str, colour, bite_frac: float,
     cv2.putText(frame, HINTS, (10, h - 10), FONT, 0.38, (130, 130, 130), 1)
 
 
+def draw_version(frame, version: str, pending_update: str = "") -> None:
+    """Running version in the bottom-right corner, plus a note when an
+    update is downloaded and waiting for an idle moment to install."""
+    h, w = frame.shape[:2]
+    text = f"v{version}"
+    (tw, _), _ = cv2.getTextSize(text, FONT, 0.38, 1)
+    cv2.putText(frame, text, (w - tw - 10, h - 10), FONT, 0.38, (130, 130, 130), 1)
+    if pending_update:
+        note = f"update v{pending_update} ready - installs when idle"
+        (nw, _), _ = cv2.getTextSize(note, FONT, 0.4, 1)
+        cv2.putText(frame, note, (w - nw - 10, h - 32), FONT, 0.4, AMBER, 1)
+
+
 def draw_camera_off(frame, controls: Controls) -> None:
     h, w = frame.shape[:2]
     frame[:] = 0

@@ -80,8 +80,9 @@ class WarningPopup:
 
     BG = "#1a0000"
 
-    def __init__(self, icon_path: str | None = None):
+    def __init__(self, icon_path: str | None = None, version: str = ""):
         self._icon_path = icon_path
+        self._version = version
         self._want_visible = False
         self._shown = False
         self._root = None
@@ -143,6 +144,12 @@ class WarningPopup:
                                          font=("Segoe UI", 16), fg="#aa6666",
                                          bg=self.BG)
             self._count_label.pack()
+
+            if self._version:
+                tk.Label(root, text=f"Sauron v{self._version}",
+                         font=("Segoe UI", 10), fg="#663333",
+                         bg=self.BG).place(relx=1.0, rely=1.0, anchor="se",
+                                           x=-16, y=-12)
 
             self._poll()
             root.mainloop()
