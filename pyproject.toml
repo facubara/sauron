@@ -1,0 +1,28 @@
+[project]
+name = "sauron"
+version = "0.2.0"
+description = "Webcam nail-biting detector: fullscreen warning + looping sound until you stop"
+requires-python = ">=3.10"
+dependencies = [
+    "mediapipe>=0.10.14",
+    "opencv-python>=4.9",
+    "numpy>=1.26",
+    "pygame>=2.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5", "pyinstaller>=6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]

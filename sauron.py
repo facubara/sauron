@@ -1,919 +1,467 @@
 """
 Sauron - Nail Biting Detection System
-Uses webcam + MediaPipe (Hand + Pose + Face landmarkers) to detect nail biting,
-then shows a fullscreen popup and plays a warning sound.
+Uses webcam + MediaPipe (Hand + Face landmarkers) to detect nail biting,
+then shows a fullscreen popup and plays a warning sound until you stop.
 
-Detection strategy (layered):
-1. HandLandmarker fingertips near mouth (precise, tight threshold)
-2. PoseLandmarker wrist near mouth (fallback when hand tracker fails)
-3. Wrist-was-approaching + tracking lost (catches hand arriving at face)
+Module map:
+    config.py    settings file, phrases, daily stats (pure Python)
+    detector.py  face/hand geometry and the dwell state machine (pure Python)
+    alerts.py    looping sound + fullscreen Tk popup
+    hud.py       OpenCV overlay, clickable controls, keyboard hints
+    sauron.py    this file: camera loop and glue
 
-All landmarkers run in VIDEO mode for temporal smoothing.
-FaceLandmarker provides accurate mouth position.
+Hotkeys in the webcam window:
+    q / Esc  quit          m  mute/unmute       c  camera on/off
+    s        snooze/unsnooze (length in config.json)   - / +  volume
 """
 
-import cv2
-import mediapipe as mp
-import threading
-import time
-import tkinter as tk
-import math
-import os
-import sys
-import random
-import pygame
+from __future__ import annotations
+
 import ctypes
-import json
+import logging
+import logging.handlers
+import os
+import random
+import sys
+import time
+import traceback
 from datetime import date
 
-BaseOptions = mp.tasks.BaseOptions
-PoseLandmarker = mp.tasks.vision.PoseLandmarker
-PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
-HandLandmarker = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-FaceLandmarker = mp.tasks.vision.FaceLandmarker
-FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-VisionRunningMode = mp.tasks.vision.RunningMode
+import cv2
+import numpy as np
 
-# PyInstaller bundles data files into sys._MEIPASS; fall back to script dir
-SCRIPT_DIR = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-ICON_PATH = os.path.join(SCRIPT_DIR, "sauron-icon.ico")
-WINDOW_TITLE = "Sauron - Nail Bite Detector"
+import hud
+from alerts import AudioPlayer, WarningPopup
+from config import (
+    APP_NAME,
+    LOG_PATH,
+    USER_DATA_DIR,
+    WINDOW_TITLE,
+    Settings,
+    asset_path,
+    clean_streak,
+    load_phrases,
+    load_settings,
+    load_stats,
+    record_bite,
+    save_stats,
+    today_count,
+)
+from detector import (
+    HAND_FINGERTIPS,
+    BiteStateMachine,
+    FaceMemory,
+    fingertip_proximity,
+    fingertip_threshold,
+    select_user_face,
+)
 
-# Writable user-data dir (APPDATA is read-write; SCRIPT_DIR is _MEIPASS in PyInstaller builds)
-USER_DATA_DIR = os.path.join(
-    os.environ.get("APPDATA") or os.path.expanduser("~"), "Sauron")
-STATS_PATH = os.path.join(USER_DATA_DIR, "stats.json")
+log = logging.getLogger("sauron")
+
+ICON_PATH = asset_path("sauron-icon.ico")
+WARNING_SOUNDS = [asset_path("isengard.mp3"), asset_path("sauron-sound.mp3")]
+MODEL_FILES = {
+    "hand": asset_path("hand_landmarker.task"),
+    "face": asset_path("face_landmarker.task"),
+}
+MUTEX_NAME = "Local\\SauronNailBiteDetector"
+IS_WINDOWS = sys.platform == "win32"
 
 
-def load_today_count():
-    """Return today's violation count, resetting if the stored date is stale."""
-    today = date.today().isoformat()
-    try:
-        with open(STATS_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        if data.get("date") == today:
-            return int(data.get("count", 0))
-    except (OSError, ValueError, KeyError):
-        pass
-    return 0
-
-
-def save_today_count(count):
+# ---------------------------------------------------------------------------
+# Platform helpers
+# ---------------------------------------------------------------------------
+def setup_logging(level: str = "INFO") -> None:
+    """Rotating file log in %APPDATA%\\Sauron plus stderr when there is one
+    (the windowed .exe has no console, so the file is the only trace)."""
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level, logging.INFO))
+    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     try:
         os.makedirs(USER_DATA_DIR, exist_ok=True)
-        with open(STATS_PATH, "w", encoding="utf-8") as f:
-            json.dump({"date": date.today().isoformat(), "count": count}, f)
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_PATH, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
     except OSError:
         pass
+    if sys.stderr is not None:
+        sh = logging.StreamHandler(sys.stderr)
+        sh.setFormatter(logging.Formatter("%(levelname)-7s %(message)s"))
+        root.addHandler(sh)
 
 
-# ---------------------------------------------------------------------------
-# Audio
-# ---------------------------------------------------------------------------
-WARNING_SOUNDS = [
-    os.path.join(SCRIPT_DIR, "isengard.mp3"),
-    os.path.join(SCRIPT_DIR, "sauron-sound.mp3"),
-]
+def fatal_dialog(message: str) -> None:
+    """Show a native error box (the exe has no console to print to)."""
+    log.error(message)
+    if IS_WINDOWS:
+        try:
+            MB_ICONERROR = 0x10
+            ctypes.windll.user32.MessageBoxW(0, message, APP_NAME, MB_ICONERROR)
+            return
+        except Exception:
+            pass
+    print(f"ERROR: {message}", file=sys.stderr)
 
-pygame.mixer.init()
 
-
-def play_warning():
-    """Start looping a warning sound. Keeps playing until stop_warning()."""
+def acquire_single_instance() -> bool:
+    """Return False if another Sauron is already running (two instances
+    would fight over the webcam). The mutex is released when the process
+    exits."""
+    if not IS_WINDOWS:
+        return True
     try:
-        sound_file = random.choice(WARNING_SOUNDS)
-        pygame.mixer.music.load(sound_file)
-        pygame.mixer.music.play(loops=-1)
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.CreateMutexW(None, False, MUTEX_NAME)
+        ERROR_ALREADY_EXISTS = 183
+        if not handle:
+            return True
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            return False
+        acquire_single_instance.handle = handle  # keep it alive
+        return True
+    except Exception:
+        return True
+
+
+def set_window_icon(title: str, icon_path: str) -> None:
+    """OpenCV windows have no icon API; set it through Win32."""
+    if not IS_WINDOWS:
+        return
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.FindWindowW(None, title)
+        if not hwnd:
+            return
+        IMAGE_ICON, LR_LOADFROMFILE, LR_DEFAULTSIZE = 1, 0x0010, 0x0040
+        icon = user32.LoadImageW(0, icon_path, IMAGE_ICON, 0, 0,
+                                 LR_LOADFROMFILE | LR_DEFAULTSIZE)
+        if icon:
+            WM_SETICON, ICON_SMALL, ICON_BIG = 0x0080, 0, 1
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon)
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, icon)
     except Exception:
         pass
 
 
-def stop_warning():
+def window_closed(title: str) -> bool:
+    """True once the user closed the webcam window with the title-bar X.
+    Without this check cv2.imshow would silently recreate the window."""
     try:
-        pygame.mixer.music.stop()
-    except Exception:
-        pass
+        return cv2.getWindowProperty(title, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
 
 
 # ---------------------------------------------------------------------------
-# Popup
+# Camera / models
 # ---------------------------------------------------------------------------
-# Hardcoded fallback if phrases.txt is missing or empty.
-# ASCII letters + space + period + comma only — no apostrophes, no question
-# marks, no accents. Reachable on any standard keyboard layout without dead
-# keys or AltGr combos.
-DEFAULT_PHRASES = [
-    "Not all those who wander are lost.",
-    "You shall not pass.",
-    "All we have to decide is what to do with the time that is given us.",
-    "Many that live deserve death. And some that die deserve life.",
-    "Even the very wise cannot see all ends.",
-    "Speak friend and enter.",
-]
+def open_camera(settings: Settings):
+    cap = cv2.VideoCapture(settings.camera_index)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.camera_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.camera_height)
+        log.info("Camera %d opened at %dx%d", settings.camera_index,
+                 cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+                 cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    else:
+        log.warning("Camera %d could not be opened", settings.camera_index)
+    return cap
 
 
-def load_phrases():
-    """Load phrases from disk. Tries user override first, then bundled
-    default, then falls back to DEFAULT_PHRASES.
+def create_landmarkers():
+    """Hand + face landmarkers in VIDEO mode (temporal smoothing)."""
+    import mediapipe as mp
 
-    File format: one phrase per line. Blank lines and lines starting with
-    '#' are ignored.
-    """
-    candidates = [
-        os.path.join(USER_DATA_DIR, "phrases.txt"),  # user-editable override
-        os.path.join(SCRIPT_DIR, "phrases.txt"),     # bundled default
-    ]
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                lines = [ln.strip() for ln in f]
-        except OSError:
-            continue
-        phrases = [ln for ln in lines if ln and not ln.startswith("#")]
-        if phrases:
-            return phrases
-    return list(DEFAULT_PHRASES)
+    missing = [p for p in MODEL_FILES.values() if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError("Missing model file(s): " + ", ".join(missing))
 
-
-LOTR_PHRASES = load_phrases()
-
-
-class WarningPopup:
-    """Fullscreen alert with a typing challenge that must be completed
-    before the alert can dismiss.
-
-    Runs Tk in its own thread; hide() and challenge_passed() are thread-safe.
-    """
-
-    def __init__(self):
-        self._visible = False
-        self._root = None
-        self._thread = None
-        self._target = ""
-        self._typed = ""
-        self._cursor = 0
-        self._challenge_passed = threading.Event()
-        self._phrase_widget = None
-        self._typed_widget = None
-        self._cursor_visible = True
-
-    def show(self):
-        if self._visible:
-            return
-        self._visible = True
-        # Fresh phrase + reset state for this alert
-        self._target = random.choice(LOTR_PHRASES)
-        self._typed = ""
-        self._cursor = 0
-        self._challenge_passed.clear()
-        self._cursor_visible = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def challenge_passed(self) -> bool:
-        return self._challenge_passed.is_set()
-
-    def hide(self):
-        root = self._root
-        if root is not None:
-            try:
-                root.after(0, self._close)
-            except Exception:
-                pass
-
-    def _run(self):
-        root = tk.Tk()
-        self._root = root
-        root.attributes("-fullscreen", True)
-        root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.92)
-        root.configure(bg="#1a0000")
-        root.overrideredirect(True)
-        try:
-            root.iconbitmap(ICON_PATH)
-        except Exception:
-            pass
-
-        frame = tk.Frame(root, bg="#1a0000")
-        frame.place(relx=0.5, rely=0.5, anchor="center")
-
-        tk.Label(frame, text="STOP BITING YOUR NAILS!",
-                 font=("Segoe UI", 54, "bold"), fg="#ff3333",
-                 bg="#1a0000").pack(pady=(0, 10))
-        tk.Label(frame, text="Type the phrase to dismiss:",
-                 font=("Segoe UI", 22), fg="#ff9999",
-                 bg="#1a0000").pack(pady=(0, 24))
-
-        # Phrase display — Text widget with tags for per-character coloring
-        phrase = tk.Text(frame, font=("Consolas", 26, "bold"),
-                         bg="#1a0000", fg="#ff9999",
-                         bd=0, highlightthickness=0, wrap="word",
-                         height=4, width=48, cursor="arrow",
-                         padx=20, pady=10)
-        phrase.tag_configure("correct", foreground="#66ff66",
-                             background="#1a3a1a")
-        phrase.tag_configure("cursor_on", foreground="#ffff66",
-                             background="#3a2a00", underline=True)
-        phrase.tag_configure("cursor_off", foreground="#ffff66",
-                             background="#3a2a00")
-        phrase.tag_configure("flash", foreground="#ffffff",
-                             background="#aa0000")
-        phrase.tag_configure("done", foreground="#88ff88",
-                             background="#1a4a1a")
-        phrase.insert("1.0", self._target)
-        phrase.config(state="disabled")
-        phrase.pack(pady=(0, 24))
-        self._phrase_widget = phrase
-
-        # Typed mirror — shows exactly what the user has pressed (incl. mistakes)
-        mirror = tk.Text(frame, font=("Consolas", 16),
-                         bg="#0a0000", fg="#999999",
-                         bd=0, highlightthickness=0, wrap="word",
-                         height=2, width=70, cursor="arrow",
-                         padx=12, pady=6)
-        mirror.tag_configure("ok", foreground="#88ff88")
-        mirror.tag_configure("bad", foreground="#ff5555",
-                             background="#3a0000")
-        mirror.config(state="disabled")
-        mirror.pack()
-        self._typed_widget = mirror
-
-        tk.Label(frame, text="Backspace clears your typed log. Mistakes don't"
-                 " regress your progress.",
-                 font=("Segoe UI", 11, "italic"), fg="#664444",
-                 bg="#1a0000").pack(pady=(14, 0))
-
-        root.bind("<Key>", self._on_key)
-        root.bind("<FocusOut>", lambda _e: root.after(60, self._refocus))
-        root.focus_force()
-
-        self._render_phrase()
-        self._update_typed_mirror()
-        self._pulse_cursor()
-
-        root.mainloop()
-
-    def _refocus(self):
-        try:
-            if self._root is not None:
-                self._root.focus_force()
-        except Exception:
-            pass
-
-    def _on_key(self, event):
-        if event.keysym == "BackSpace":
-            if self._typed:
-                self._typed = self._typed[:-1]
-                self._update_typed_mirror()
-            return
-        ch = event.char
-        if not ch or ord(ch[0]) < 32 or ord(ch[0]) == 127:
-            return
-        if self._cursor >= len(self._target):
-            return
-
-        self._typed += ch
-        expected = self._target[self._cursor]
-        if ch == expected:
-            self._cursor += 1
-            self._render_phrase()
-            if self._cursor >= len(self._target):
-                self._challenge_passed.set()
-                self._completion_flash()
-        else:
-            self._flash_mistake()
-        self._update_typed_mirror()
-
-    def _render_phrase(self):
-        widget = self._phrase_widget
-        if widget is None:
-            return
-        try:
-            widget.config(state="normal")
-            for tag in ("correct", "cursor_on", "cursor_off"):
-                widget.tag_remove(tag, "1.0", "end")
-            if self._cursor > 0:
-                widget.tag_add("correct", "1.0", f"1.{self._cursor}")
-            if self._cursor < len(self._target):
-                tag = "cursor_on" if self._cursor_visible else "cursor_off"
-                widget.tag_add(tag, f"1.{self._cursor}",
-                               f"1.{self._cursor + 1}")
-            widget.config(state="disabled")
-        except Exception:
-            pass
-
-    def _pulse_cursor(self):
-        if self._root is None:
-            return
-        self._cursor_visible = not self._cursor_visible
-        self._render_phrase()
-        try:
-            self._root.after(450, self._pulse_cursor)
-        except Exception:
-            pass
-
-    def _flash_mistake(self):
-        widget = self._phrase_widget
-        if widget is None or self._cursor >= len(self._target):
-            return
-        try:
-            widget.config(state="normal")
-            widget.tag_add("flash", f"1.{self._cursor}",
-                           f"1.{self._cursor + 1}")
-            widget.config(state="disabled")
-            self._root.after(160, self._clear_flash)
-        except Exception:
-            pass
-
-    def _clear_flash(self):
-        widget = self._phrase_widget
-        if widget is None:
-            return
-        try:
-            widget.config(state="normal")
-            widget.tag_remove("flash", "1.0", "end")
-            widget.config(state="disabled")
-        except Exception:
-            pass
-
-    def _completion_flash(self):
-        widget = self._phrase_widget
-        if widget is None:
-            return
-        try:
-            widget.config(state="normal")
-            widget.tag_remove("correct", "1.0", "end")
-            widget.tag_remove("cursor_on", "1.0", "end")
-            widget.tag_remove("cursor_off", "1.0", "end")
-            widget.tag_add("done", "1.0", "end")
-            widget.config(state="disabled")
-        except Exception:
-            pass
-
-    def _update_typed_mirror(self):
-        widget = self._typed_widget
-        if widget is None:
-            return
-        # Reconstruct the typed sequence with per-char correctness
-        try:
-            widget.config(state="normal")
-            widget.delete("1.0", "end")
-            cursor = 0
-            for ch in self._typed:
-                if cursor < len(self._target) and ch == self._target[cursor]:
-                    widget.insert("end", ch, "ok")
-                    cursor += 1
-                else:
-                    widget.insert("end", ch, "bad")
-            widget.config(state="disabled")
-        except Exception:
-            pass
-
-    def _close(self):
-        self._phrase_widget = None
-        self._typed_widget = None
-        if self._root:
-            try:
-                self._root.destroy()
-            except Exception:
-                pass
-        self._root = None
-        self._visible = False
-
-
-# ---------------------------------------------------------------------------
-# Landmark indices
-# ---------------------------------------------------------------------------
-# Pose
-POSE_NOSE = 0
-POSE_MOUTH_LEFT = 9
-POSE_MOUTH_RIGHT = 10
-POSE_LEFT_SHOULDER = 11
-POSE_RIGHT_SHOULDER = 12
-POSE_LEFT_WRIST = 15
-POSE_RIGHT_WRIST = 16
-
-# Hand (21-point model)
-HAND_THUMB_TIP = 4
-HAND_INDEX_TIP = 8
-HAND_MIDDLE_TIP = 12
-HAND_RING_TIP = 16
-HAND_PINKY_TIP = 20
-HAND_FINGERTIPS = [HAND_THUMB_TIP, HAND_INDEX_TIP, HAND_MIDDLE_TIP,
-                   HAND_RING_TIP, HAND_PINKY_TIP]
-
-# Face mesh (478-point model) — mouth landmarks
-FACE_UPPER_LIP = 13
-FACE_LOWER_LIP = 14
-
-# Pose skeleton connections for drawing
-POSE_CONNECTIONS = [
-    (11, 12), (11, 13), (12, 14), (13, 15), (14, 16),
-    (15, 17), (15, 19), (15, 21), (16, 18), (16, 20), (16, 22),
-    (17, 19), (18, 20), (11, 23), (12, 24),
-]
-
-
-def dist(x1, y1, x2, y2):
-    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
-
-
-def lm_visibility(landmark):
-    """Get landmark visibility score, defaulting to 0."""
-    v = getattr(landmark, 'visibility', None)
-    return v if v is not None else 0.0
-
-
-# HUD control regions (x1, y1, x2, y2) for 640px-wide frame
-_CTRL_MUTE = (465, 10, 545, 35)
-_CTRL_CAM = (555, 10, 630, 35)
-_CTRL_VOL = (465, 42, 630, 56)
-
-
-def _draw_controls(frame, controls):
-    """Draw mute, camera, and volume controls on the HUD."""
-    mx1, my1, mx2, my2 = _CTRL_MUTE
-    cx1, cy1, cx2, cy2 = _CTRL_CAM
-    vx1, vy1, vx2, vy2 = _CTRL_VOL
-
-    # Mute button
-    mute_bg = (0, 0, 160) if controls["muted"] else (50, 50, 50)
-    cv2.rectangle(frame, (mx1, my1), (mx2, my2), mute_bg, -1)
-    cv2.rectangle(frame, (mx1, my1), (mx2, my2), (150, 150, 150), 1)
-    mute_label = "MUTED" if controls["muted"] else "MUTE"
-    cv2.putText(frame, mute_label, (mx1 + 12, my2 - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
-
-    # Camera button
-    cam_bg = (0, 0, 160) if controls["camera_off"] else (50, 50, 50)
-    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), cam_bg, -1)
-    cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (150, 150, 150), 1)
-    cam_label = "CAM OFF" if controls["camera_off"] else "CAM"
-    cv2.putText(frame, cam_label, (cx1 + 5, cy2 - 8),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-    # Volume slider
-    vol_fill_x = int(vx1 + (vx2 - vx1) * controls["volume"])
-    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (40, 40, 40), -1)
-    cv2.rectangle(frame, (vx1, vy1), (vol_fill_x, vy2), (0, 160, 0), -1)
-    cv2.rectangle(frame, (vx1, vy1), (vx2, vy2), (150, 150, 150), 1)
-    knob_y = (vy1 + vy2) // 2
-    cv2.circle(frame, (vol_fill_x, knob_y), 8, (220, 220, 220), -1)
-    cv2.circle(frame, (vol_fill_x, knob_y), 8, (150, 150, 150), 1)
-    vol_pct = int(controls["volume"] * 100)
-    cv2.putText(frame, f"VOL {vol_pct}%", (vx1, vy2 + 14),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main():
-    # --- Create landmarkers (all VIDEO mode for temporal smoothing) ---
-    pose_landmarker = PoseLandmarker.create_from_options(PoseLandmarkerOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(SCRIPT_DIR, "pose_landmarker.task")
-        ),
-        running_mode=VisionRunningMode.VIDEO,
-        num_poses=1,
-        min_pose_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ))
-
-    hand_landmarker = HandLandmarker.create_from_options(HandLandmarkerOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(SCRIPT_DIR, "hand_landmarker.task")
-        ),
-        running_mode=VisionRunningMode.VIDEO,
+    vision = mp.tasks.vision
+    base = mp.tasks.BaseOptions
+    hand = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
+        base_options=base(model_asset_path=MODEL_FILES["hand"]),
+        running_mode=vision.RunningMode.VIDEO,
         num_hands=2,
         min_hand_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ))
-
-    face_landmarker = FaceLandmarker.create_from_options(FaceLandmarkerOptions(
-        base_options=BaseOptions(
-            model_asset_path=os.path.join(SCRIPT_DIR, "face_landmarker.task")
-        ),
-        running_mode=VisionRunningMode.VIDEO,
-        num_faces=1,
+    # num_faces=3 so we can pick the user (largest face) even when other
+    # people are in frame, instead of locking onto whoever appears first.
+    face = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+        base_options=base(model_asset_path=MODEL_FILES["face"]),
+        running_mode=vision.RunningMode.VIDEO,
+        num_faces=3,
         min_face_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ))
+    return mp, hand, face
 
-    cap = cv2.VideoCapture(0)
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+def main(settings: Settings) -> None:
+    mp, hand_landmarker, face_landmarker = create_landmarkers()
+
+    phrases = load_phrases() if settings.show_phrases else []
+    stats = load_stats()
+    streak_days = clean_streak(stats)
+    log.info("Bites today so far: %d, clean streak: %d days",
+             today_count(stats), streak_days)
+
+    audio = AudioPlayer(WARNING_SOUNDS)
+    popup = WarningPopup(ICON_PATH)
+    controls = hud.Controls(muted=settings.start_muted, volume=settings.volume)
+    audio.set_volume(controls.effective_volume())
+
+    machine = BiteStateMachine(settings)
+    face_memory = FaceMemory(settings.face_memory_seconds)
+
+    cap = open_camera(settings)
     if not cap.isOpened():
-        print("ERROR: Cannot open webcam.")
-        return
+        raise RuntimeError(
+            f"Cannot open webcam {settings.camera_index}. Is another app using "
+            f"it? You can change camera_index in\n{USER_DATA_DIR}\\config.json")
+    time.sleep(1.0)  # let the camera settle before the first read
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    # Give the camera time to initialize before reading frames
-    time.sleep(1.0)
-
-    # Create OpenCV window and set its icon via Win32 API
     cv2.namedWindow(WINDOW_TITLE, cv2.WINDOW_AUTOSIZE)
-    try:
-        user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, WINDOW_TITLE)
-        if hwnd:
-            IMAGE_ICON = 1
-            LR_LOADFROMFILE = 0x0010
-            LR_DEFAULTSIZE = 0x0040
-            icon = user32.LoadImageW(
-                0, ICON_PATH, IMAGE_ICON, 0, 0,
-                LR_LOADFROMFILE | LR_DEFAULTSIZE)
-            if icon:
-                ICON_SMALL = 0
-                ICON_BIG = 1
-                WM_SETICON = 0x0080
-                user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, icon)
-                user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, icon)
-    except Exception:
-        pass
+    set_window_icon(WINDOW_TITLE, ICON_PATH)
+    cv2.setMouseCallback(WINDOW_TITLE, hud.make_mouse_callback(controls, audio.set_volume))
 
-    popup = WarningPopup()
-
-    controls = {
-        "muted": False,
-        "camera_off": False,
-        "volume": 0.5,
-        "dragging_volume": False,
-    }
-    pygame.mixer.music.set_volume(controls["volume"])
-
-    def on_mouse(event, x, y, flags, param):
-        ctrl = param
-        mx1, my1, mx2, my2 = _CTRL_MUTE
-        cx1, cy1, cx2, cy2 = _CTRL_CAM
-        vx1, vy1, vx2, vy2 = _CTRL_VOL
-
-        if event == cv2.EVENT_LBUTTONDOWN:
-            if mx1 <= x <= mx2 and my1 <= y <= my2:
-                ctrl["muted"] = not ctrl["muted"]
-                pygame.mixer.music.set_volume(
-                    0.0 if ctrl["muted"] else ctrl["volume"])
-            elif cx1 <= x <= cx2 and cy1 <= y <= cy2:
-                ctrl["camera_off"] = not ctrl["camera_off"]
-            elif vx1 <= x <= vx2 and vy1 - 5 <= y <= vy2 + 5:
-                ctrl["dragging_volume"] = True
-                ctrl["volume"] = max(0.0, min(1.0,
-                                              (x - vx1) / (vx2 - vx1)))
-                if not ctrl["muted"]:
-                    pygame.mixer.music.set_volume(ctrl["volume"])
-        elif event == cv2.EVENT_MOUSEMOVE and (flags & cv2.EVENT_FLAG_LBUTTON):
-            if ctrl["dragging_volume"]:
-                ctrl["volume"] = max(0.0, min(1.0,
-                                              (x - vx1) / (vx2 - vx1)))
-                if not ctrl["muted"]:
-                    pygame.mixer.music.set_volume(ctrl["volume"])
-        elif event == cv2.EVENT_LBUTTONUP:
-            ctrl["dragging_volume"] = False
-
-    cv2.setMouseCallback(WINDOW_TITLE, on_mouse, controls)
-
-    bite_frames = 0
-    clear_frames = 0
-    BITE_THRESHOLD_FRAMES = 6
-    CLEAR_THRESHOLD_FRAMES = 15  # ~0.5s of clean frames before dismissing
-    alert_active = False
-    alert_started_at = 0.0
-    MIN_ALERT_SECONDS = 0.6      # don't flicker on brief false clears
-    last_log = 0
-    frame_count = 0
-
-    violation_count = load_today_count()
+    blank = np.zeros((settings.camera_height, hud.HUD_WIDTH, 3), dtype=np.uint8)
+    t0 = time.monotonic()
+    prev_t = t0
+    last_ts_ms = -1
+    last_log = 0.0
+    failed_reads = 0
+    detect_errors = 0
     current_day = date.today().isoformat()
+    quit_requested = False
 
-    # Wrist trajectory tracking (for "approaching mouth then lost" detection)
-    prev_wrist_dist = {"L": None, "R": None}   # previous distance to mouth
-    wrist_approaching = {"L": False, "R": False}
+    def stop_alert(reason: str) -> None:
+        if machine.force_clear():
+            log.info("<<< CLEAR (%s)", reason)
+        popup.hide()
+        audio.stop()
 
-    # Face/mouth occlusion tracking
-    face_present_streak = 0       # consecutive frames with face detected
-    prev_mouth_pos = None         # (x, y) of last mouth center
-    FACE_STREAK_MIN = 10          # need this many frames of face before "lost" counts
+    def handle_key(key: int, now: float) -> None:
+        nonlocal quit_requested
+        if key in (ord("q"), 27):
+            quit_requested = True
+        elif key == ord("m"):
+            controls.muted = not controls.muted
+            audio.set_volume(controls.effective_volume())
+        elif key == ord("c"):
+            controls.camera_off = not controls.camera_off
+        elif key == ord("s"):
+            if controls.snoozed(now):
+                controls.snooze_until = 0.0
+                log.info("Snooze cancelled")
+            else:
+                controls.snooze_until = now + settings.snooze_minutes * 60
+                machine.reset_dwell()
+                log.info("Snoozed for %.1f min", settings.snooze_minutes)
+        elif key in (ord("+"), ord("=")):
+            controls.volume = min(1.0, controls.volume + 0.1)
+            audio.set_volume(controls.effective_volume())
+        elif key in (ord("-"), ord("_")):
+            controls.volume = max(0.0, controls.volume - 0.1)
+            audio.set_volume(controls.effective_volume())
 
-    print("Sauron is watching... Press 'q' in the webcam window to quit.")
-    print("--- Debug log (every 0.5s) ---")
+    log.info("Sauron is watching. Press q in the webcam window to quit.")
 
     try:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                if cv2.waitKey(30) & 0xFF == ord("q"):
-                    break
-                continue
+        while not quit_requested:
+            now = time.monotonic()
+            dt = min(now - prev_t, 0.25)  # cap dt across stalls
+            prev_t = now
 
-            frame = cv2.flip(frame, 1)
-            h, w, _ = frame.shape
-
-            # Camera off: show black frame with controls only
-            if controls["camera_off"]:
-                if alert_active:
-                    alert_active = False
-                    popup.hide()
-                    stop_warning()
-                frame[:] = 0
-                cv2.putText(frame, "CAMERA OFF", (w // 2 - 115, h // 2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 100, 100), 2)
-                _draw_controls(frame, controls)
+            # ---------------- Camera off: release the device ----------------
+            if controls.camera_off:
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                    face_memory.reset()
+                    stop_alert("camera off")
+                    log.info("Camera released")
+                frame = blank.copy()
+                hud.draw_camera_off(frame, controls)
                 cv2.imshow(WINDOW_TITLE, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                handle_key(cv2.waitKey(100) & 0xFF, now)
+                if window_closed(WINDOW_TITLE):
                     break
                 continue
 
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            if cap is None:
+                cap = open_camera(settings)
+                if cap.isOpened():
+                    time.sleep(0.5)
 
-            # Monotonically increasing timestamp for VIDEO mode
-            frame_count += 1
-            timestamp_ms = frame_count * 33  # ~30 fps
+            ret, frame = cap.read() if cap.isOpened() else (False, None)
+            if not ret:
+                failed_reads += 1
+                if failed_reads >= 60:  # unplugged / driver hiccup: reopen
+                    failed_reads = 0
+                    log.warning("Camera read failing; reopening")
+                    cap.release()
+                    time.sleep(0.5)
+                    cap = open_camera(settings)
+                frame = blank.copy()
+                cv2.putText(frame, "NO CAMERA SIGNAL", (190, 240), hud.FONT, 0.8,
+                            (100, 100, 100), 2)
+                hud.draw_controls(frame, controls)
+                cv2.imshow(WINDOW_TITLE, frame)
+                handle_key(cv2.waitKey(30) & 0xFF, now)
+                if window_closed(WINDOW_TITLE):
+                    break
+                continue
+            failed_reads = 0
 
-            # Run all three landmarkers
-            pose_result = pose_landmarker.detect_for_video(mp_image, timestamp_ms)
-            hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-            face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
+            frame = hud.fit_width(cv2.flip(frame, 1))
+            h, w = frame.shape[:2]
 
-            now = time.time()
-            detected = False
-            detection_method = ""
-            min_d = float("inf")
-            threshold = 0
-            side = ""
+            # Strictly increasing wall-clock timestamps for VIDEO mode, so a
+            # stall or a camera reopen is visible to the trackers' smoothing.
+            ts_ms = max(int((now - t0) * 1000), last_ts_ms + 1)
+            last_ts_ms = ts_ms
 
-            has_pose = len(pose_result.pose_landmarks) > 0
-            has_hands = len(hand_result.hand_landmarks) > 0
-            has_face = len(face_result.face_landmarks) > 0
+            try:
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                hand_result = hand_landmarker.detect_for_video(mp_image, ts_ms)
+                face_result = face_landmarker.detect_for_video(mp_image, ts_ms)
+            except Exception as exc:
+                # Never let a bad frame kill the watcher
+                detect_errors += 1
+                if detect_errors <= 5 or detect_errors % 100 == 0:
+                    log.warning("Detection error #%d (skipping frame): %s",
+                                detect_errors, exc)
+                cv2.imshow(WINDOW_TITLE, frame)
+                handle_key(cv2.waitKey(1) & 0xFF, now)
+                if window_closed(WINDOW_TITLE):
+                    break
+                continue
 
-            # ----- Mouth position (face mesh preferred, pose fallback) -----
-            mouth_cx, mouth_cy = None, None
-            mouth_jump = 0.0  # how far mouth moved vs last frame (pixels)
+            # ---------------- Geometry ----------------
+            fresh_face = select_user_face(face_result.face_landmarks, w, h, settings)
+            face = face_memory.update(fresh_face, now)
+            hands = hand_result.hand_landmarks
+            prox = fingertip_proximity(hands, hand_result.handedness, face, w, h,
+                                       settings)
+            mouth_open = face.mouth_open_ratio if (face and not face.remembered) else 0.0
 
-            if has_face:
-                face_lm = face_result.face_landmarks[0]
-                upper = face_lm[FACE_UPPER_LIP]
-                lower = face_lm[FACE_LOWER_LIP]
-                mouth_cx = (upper.x + lower.x) / 2 * w
-                mouth_cy = (upper.y + lower.y) / 2 * h
-                # Track mouth jump (sudden landmark shift = occlusion)
-                if prev_mouth_pos is not None:
-                    mouth_jump = dist(mouth_cx, mouth_cy,
-                                      prev_mouth_pos[0], prev_mouth_pos[1])
-                prev_mouth_pos = (mouth_cx, mouth_cy)
-                face_present_streak += 1
-            elif has_pose:
-                pose_lm = pose_result.pose_landmarks[0]
-                ml = pose_lm[POSE_MOUTH_LEFT]
-                mr = pose_lm[POSE_MOUTH_RIGHT]
-                if lm_visibility(ml) > 0.5 and lm_visibility(mr) > 0.5:
-                    mouth_cx = (ml.x + mr.x) / 2 * w
-                    mouth_cy = (ml.y + mr.y) / 2 * h
+            # ---------------- Temporal state ----------------
+            snoozed = controls.snoozed(now)
+            event = machine.update(prox.raw_near, mouth_open, dt, now, inhibit=snoozed)
 
-            # ----- Shoulder width (for scale-adaptive thresholds) -----
-            shoulder_d = None
-            if has_pose:
-                pose_lm = pose_result.pose_landmarks[0]
-                ls = pose_lm[POSE_LEFT_SHOULDER]
-                rs = pose_lm[POSE_RIGHT_SHOULDER]
-                if lm_visibility(ls) > 0.5 and lm_visibility(rs) > 0.5:
-                    shoulder_d = dist(ls.x * w, ls.y * h, rs.x * w, rs.y * h)
-
-            # =============================================================
-            # DETECTION METHOD 1: Hand tracker fingertips near mouth (precise)
-            # =============================================================
-            if has_hands and mouth_cx is not None:
-                hand_thr = 50.0
-                if shoulder_d:
-                    hand_thr = max(shoulder_d * 0.2, 35.0)
-
-                for i, hand_lm in enumerate(hand_result.hand_landmarks):
-                    for tip_id in HAND_FINGERTIPS:
-                        tip = hand_lm[tip_id]
-                        tx, ty = tip.x * w, tip.y * h
-                        d = dist(tx, ty, mouth_cx, mouth_cy)
-                        if d < min_d:
-                            min_d = d
-                            side = hand_result.handedness[i][0].category_name[0]
-                        if d < hand_thr and not detected:
-                            detected = True
-                            detection_method = "hand_fingertip"
-                            threshold = hand_thr
-
-            # =============================================================
-            # DETECTION METHOD 2 & 3: Pose wrist fallback + wrist-lost
-            # Fires when hand fingertips didn't already trigger detection.
-            # =============================================================
-            if has_pose and mouth_cx is not None and shoulder_d:
-                pose_lm = pose_result.pose_landmarks[0]
-                wrist_thr = shoulder_d * 0.25
-
-                for wrist_side, wrist_id in [("L", POSE_LEFT_WRIST),
-                                              ("R", POSE_RIGHT_WRIST)]:
-                    wrist = pose_lm[wrist_id]
-                    vis = lm_visibility(wrist)
-
-                    if vis < 0.6:
-                        # Low visibility — check if wrist was approaching
-                        # OR was already close when tracking was lost
-                        if not detected:
-                            prev = prev_wrist_dist[wrist_side]
-                            if prev is not None and prev < shoulder_d * 0.4:
-                                if wrist_approaching[wrist_side] or prev < wrist_thr:
-                                    detected = True
-                                    detection_method = "wrist_lost"
-                                    threshold = shoulder_d * 0.4
-                                    side = wrist_side
-                                    if prev < min_d:
-                                        min_d = prev
-                        # Reset trajectory since we can't trust the position
-                        prev_wrist_dist[wrist_side] = None
-                        wrist_approaching[wrist_side] = False
-                        continue
-
-                    wx, wy = wrist.x * w, wrist.y * h
-                    d = dist(wx, wy, mouth_cx, mouth_cy)
-
-                    # Update trajectory
-                    prev = prev_wrist_dist[wrist_side]
-                    if prev is not None:
-                        wrist_approaching[wrist_side] = d < prev - 2  # 2px hysteresis
-                    else:
-                        # First frame seeing this wrist — if already close,
-                        # treat as approaching (hand entered frame near mouth)
-                        wrist_approaching[wrist_side] = d < shoulder_d * 0.5
-                    prev_wrist_dist[wrist_side] = d
-
-                    if d < min_d:
-                        min_d = d
-                        side = wrist_side
-
-                    # Direct wrist detection when fingertip method didn't fire
-                    if not detected and d < wrist_thr:
-                        detected = True
-                        detection_method = "pose_wrist"
-                        threshold = wrist_thr
-
-            # =============================================================
-            # DETECTION METHOD 4: Mouth occluded / face lost
-            # If face was consistently tracked and suddenly lost while
-            # pose still sees you, something is blocking the mouth.
-            # Also triggers on large sudden mouth-landmark jumps.
-            # =============================================================
-            if not detected and has_pose:
-                # 4a: Face was tracked, now lost → hand covering face
-                if not has_face and face_present_streak >= FACE_STREAK_MIN:
-                    detected = True
-                    detection_method = "face_occluded"
-                    threshold = 0
-                    min_d = 0
-
-                # 4b: Mouth landmarks jumped abnormally (face mesh distorted)
-                if not detected and has_face and shoulder_d and mouth_jump > shoulder_d * 0.15:
-                    detected = True
-                    detection_method = "mouth_distorted"
-                    threshold = shoulder_d * 0.15
-                    min_d = mouth_jump
-
-            # Update face streak (reset AFTER checking method 4)
-            if not has_face:
-                face_present_streak = 0
-                prev_mouth_pos = None
-
-            # =============================================================
-            # Draw visualization
-            # =============================================================
-            # Pose skeleton
-            if has_pose:
-                pose_lm = pose_result.pose_landmarks[0]
-                for c1, c2 in POSE_CONNECTIONS:
-                    if c1 < len(pose_lm) and c2 < len(pose_lm):
-                        p1 = (int(pose_lm[c1].x * w), int(pose_lm[c1].y * h))
-                        p2 = (int(pose_lm[c2].x * w), int(pose_lm[c2].y * h))
-                        cv2.line(frame, p1, p2, (180, 180, 180), 1)
-
-            # Hand fingertips (orange dots)
-            if has_hands:
-                for hand_lm in hand_result.hand_landmarks:
-                    for tip_id in HAND_FINGERTIPS:
-                        tip = hand_lm[tip_id]
-                        cx, cy = int(tip.x * w), int(tip.y * h)
-                        cv2.circle(frame, (cx, cy), 5, (0, 165, 255), -1)
-
-            # Mouth position + threshold circle
-            if mouth_cx is not None:
-                cv2.circle(frame, (int(mouth_cx), int(mouth_cy)), 6, (0, 255, 0), -1)
-                draw_thr = threshold if threshold > 0 else (
-                    shoulder_d * 0.25 if shoulder_d else 50)
-                cv2.circle(frame, (int(mouth_cx), int(mouth_cy)), int(draw_thr),
-                           (0, 0, 255) if detected else (80, 80, 80), 1)
-
-            # ----- Consecutive-frame logic -----
-            if detected:
-                bite_frames = min(bite_frames + 1, BITE_THRESHOLD_FRAMES)
-                clear_frames = 0
-            else:
-                bite_frames = max(0, bite_frames - 1)
-                clear_frames += 1
-
-            # Trigger: sustained detection while no alert is active
-            if not alert_active and bite_frames >= BITE_THRESHOLD_FRAMES:
-                alert_active = True
-                alert_started_at = now
-                # Roll over counter if day changed mid-session
+            if event == BiteStateMachine.ALERT:
                 today = date.today().isoformat()
                 if today != current_day:
                     current_day = today
-                    violation_count = 0
-                violation_count += 1
-                save_today_count(violation_count)
-                popup.show()
-                if not controls["muted"]:
-                    play_warning()
-                print(f"  >>> ALERT #{violation_count}! method={detection_method}"
-                      f" hand={side} dist={min_d:.0f} thr={threshold:.0f}")
-
-            # Release: clean frames + min display time + typing challenge passed
-            if (alert_active
-                    and clear_frames >= CLEAR_THRESHOLD_FRAMES
-                    and now - alert_started_at >= MIN_ALERT_SECONDS
-                    and popup.challenge_passed()):
-                alert_active = False
+                    streak_days = clean_streak(stats, today)
+                count = record_bite(stats, today)
+                save_stats(stats)
+                phrase = random.choice(phrases) if phrases else ""
+                popup.show(count, phrase)
+                if not controls.muted:
+                    audio.play_loop()
+                log.info(">>> ALERT #%d today  hand=%s dist=%.0f thr=%.0f",
+                         count, prox.side, prox.min_dist, prox.threshold)
+            elif event == BiteStateMachine.CLEAR:
                 popup.hide()
-                stop_warning()
-                print(f"  <<< CLEAR ({clear_frames} clean frames, challenge passed)")
+                audio.stop()
+                log.info("<<< CLEAR (%.1fs clean)", machine.clear_time)
 
-            # If user toggles mute while alert is active, stop/start sound
-            if alert_active:
-                if controls["muted"] and pygame.mixer.music.get_busy():
-                    stop_warning()
-                elif not controls["muted"] and not pygame.mixer.music.get_busy():
-                    play_warning()
+            # Mute toggled mid-alert: stop/start the loop accordingly
+            if machine.alert_active:
+                if controls.muted and audio.playing:
+                    audio.stop()
+                elif not controls.muted and not audio.playing:
+                    audio.play_loop()
 
-            # ----- Console log (every 0.5s) -----
-            if now - last_log > 0.5:
+            # ---------------- Periodic debug line ----------------
+            if now - last_log > 0.5 and log.isEnabledFor(logging.DEBUG):
                 last_log = now
-                parts = [
-                    f"face={'Y' if has_face else 'N'}",
-                    f"hand={'Y' if has_hands else 'N'}",
-                    f"pose={'Y' if has_pose else 'N'}",
-                ]
-                if mouth_cx is not None:
-                    parts.append(f"dist={min_d:.0f}")
-                    if threshold > 0:
-                        parts.append(f"thr={threshold:.0f}")
-                    parts.append(f"bite={bite_frames}/{BITE_THRESHOLD_FRAMES}")
-                    if detected:
-                        parts.append(f"DETECTED({detection_method},{side})")
-                print("  " + " | ".join(parts))
+                parts = [f"face={'Y' if face else 'N'}{'(mem)' if face and face.remembered else ''}",
+                         f"hand={'Y' if hands else 'N'}"]
+                if prox.min_dist != float("inf"):
+                    parts.append(f"dist={prox.min_dist:.0f} thr={prox.threshold:.0f}")
+                parts.append(f"bite={machine.bite_time:.1f}/{settings.bite_dwell_seconds}s")
+                if machine.eating:
+                    parts.append("EATING-SUPPRESSED")
+                if snoozed:
+                    parts.append("SNOOZED")
+                if machine.engaged:
+                    parts.append(f"NEAR({prox.side})")
+                log.debug(" | ".join(parts))
 
-            # ----- On-screen overlay -----
-            status = f"BITING! ({detection_method})" if detected else "OK"
-            color = (0, 0, 255) if detected else (0, 200, 0)
-            cv2.putText(frame, status, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # ---------------- Draw ----------------
+            threshold = prox.threshold or (
+                fingertip_threshold(face.face_w_px, settings) if face else 0.0)
+            hud.draw_landmarks(frame, hands, HAND_FINGERTIPS, face, threshold,
+                               machine.engaged, prox.raw_near)
 
-            bar_w = int((bite_frames / BITE_THRESHOLD_FRAMES) * 200)
-            cv2.rectangle(frame, (10, 45), (10 + bar_w, 60), color, -1)
-            cv2.rectangle(frame, (10, 45), (210, 60), (100, 100, 100), 1)
+            if snoozed:
+                status, colour = "SNOOZED", hud.AMBER
+            elif machine.engaged:
+                status, colour = "BITING!", hud.RED
+            elif prox.raw_near and machine.eating:
+                status, colour = "EATING (ignored)", hud.AMBER
+            else:
+                status, colour = "OK", hud.GREEN
 
-            # Daily violation counter
-            counter_color = (0, 0, 255) if violation_count > 0 else (150, 150, 150)
-            cv2.putText(frame, f"BITES TODAY: {violation_count}", (225, 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, counter_color, 2)
-
-            # Detection source indicators
-            y_info = h - 15
-            if has_face:
-                cv2.putText(frame, "FACE", (10, y_info),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
-            if has_hands:
-                cv2.putText(frame, "HAND", (60, y_info),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
-            if has_pose:
-                cv2.putText(frame, "POSE", (120, y_info),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 0), 1)
-            if min_d < float("inf"):
-                d_color = (0, 0, 255) if detected else (200, 200, 200)
-                cv2.putText(frame, f"Dist: {min_d:.0f}px", (180, y_info),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, d_color, 1)
-
-            _draw_controls(frame, controls)
+            hud.draw_status(
+                frame, status=status, colour=colour,
+                bite_frac=machine.bite_time / settings.bite_dwell_seconds,
+                bites_today=today_count(stats), streak_days=streak_days,
+                face_seen=face is not None, hand_seen=bool(hands),
+                min_dist=prox.min_dist, engaged=machine.engaged,
+                snooze_remaining=controls.snooze_remaining(now))
+            hud.draw_controls(frame, controls)
             cv2.imshow(WINDOW_TITLE, frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+
+            handle_key(cv2.waitKey(1) & 0xFF, now)
+            if window_closed(WINDOW_TITLE):
                 break
     finally:
         popup.hide()
-        stop_warning()
-        pose_landmarker.close()
-        hand_landmarker.close()
-        face_landmarker.close()
-        cap.release()
+        audio.stop()
+        for closer in (hand_landmarker.close, face_landmarker.close):
+            try:
+                closer()
+            except Exception:
+                pass
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
         cv2.destroyAllWindows()
 
-    print("Sauron has closed its eye.")
+    log.info("Sauron has closed its eye.")
+
+
+def run() -> int:
+    settings, warnings = load_settings()
+    setup_logging(settings.log_level)
+    for warning in warnings:
+        log.warning("config.json: %s", warning)
+    log.info("Starting %s (python %s, frozen=%s)", APP_NAME,
+             sys.version.split()[0], bool(getattr(sys, "frozen", False)))
+
+    if not acquire_single_instance():
+        fatal_dialog("Sauron is already running. Look for its webcam window "
+                     "(it may be minimised).")
+        return 1
+    try:
+        main(settings)
+        return 0
+    except Exception as exc:
+        log.error("Fatal error:\n%s", traceback.format_exc())
+        fatal_dialog(f"{exc}\n\nDetails were written to:\n{LOG_PATH}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(run())

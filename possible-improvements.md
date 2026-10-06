@@ -22,7 +22,7 @@ Ideas to make Sauron's warnings harder to ignore, ordered from easy to nuclear.
 
 10. **Cursor hijack** — Move the mouse to the center of the screen during a warning so you can't keep working through it.
 
-11. ~~**Typing challenge gate** — Require typing a randomly-chosen LOTR phrase to dismiss the popup. The popup persists until the phrase is typed correctly. Active friction beats passive friction — you can't ignore something you're forced to interact with.~~ ✅
+11. **Typing challenge gate** — Require typing a randomly-chosen LOTR phrase to dismiss the popup. The popup persists until the phrase is typed correctly. Active friction beats passive friction — you can't ignore something you're forced to interact with. *Implemented in May 2026 (commit 4d4924c), removed again in the June rewrite along with the pose fallback. `phrases.txt` survived: since October 2026 the popup shows a random line from it as flavour text, and `%APPDATA%\Sauron\phrases.txt` still overrides the bundled list. The challenge could be re-added behind a `config.json` flag if wanted.*
 
 ## Workshop: extensions to the typing challenge
 
@@ -43,3 +43,21 @@ Ideas to make Sauron's warnings harder to ignore, ordered from easy to nuclear.
 19. **Random capitals** — randomly capitalise letters in the phrase to force shift-key engagement. Harder to autopilot through.
 
 20. **Cooldown timer** — even after passing the challenge, the popup stays for an extra N seconds with a "phrase passed, hold steady" message. Prevents the dopamine of dismissal from being the immediate reward of biting.
+
+
+## Done in the October 2026 pass (not warning-related, but worth knowing)
+
+- **Snooze** (`s` key, length in `config.json`) for meals and calls. Snooze blocks new alerts but still lets an active one clear.
+- **Hotkeys** for mute, camera, volume and quit; closing the webcam window with the X now actually quits instead of respawning the window.
+- **Camera off really releases the webcam** (LED goes off) instead of silently still reading frames.
+- **`config.json`** in `%APPDATA%\Sauron` exposes every threshold, so tuning no longer needs a rebuild. Bad values are logged and ignored.
+- **Per-day history** in `stats.json` plus a clean-day streak on the HUD.
+- **Face memory**: a brief face-tracking dropout while the hand covers the mouth no longer resets the dwell timer.
+- **Rotating log file** and native error dialogs, since the windowed exe has no console. Single-instance guard so two copies cannot fight over the webcam.
+- Detection logic split into `detector.py` / `config.py` with a pytest suite, so the threshold rules can be changed with a safety net.
+
+## Still open, roughly in order of payoff
+
+- **#3 Escalating aggression** is now easy: `stats.json` holds per-day counts and the alert timestamps are in the log, so "second bite within N minutes" is a few lines in `sauron.py` around the `ALERT` event, and the popup could take an `intensity` argument.
+- **#8 Windows toast** and **#9 TTS** are self-contained additions to `alerts.py`.
+- **#7 Hall of shame**: the frame is already in hand at the `ALERT` event; `cv2.imwrite` into `%APPDATA%\Sauron\shame\` is one line, plus a config flag and a retention cap.

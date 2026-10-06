@@ -3,7 +3,9 @@
     "allow": [
       "Bash(pyinstaller:*)",
       "Bash(python:*)",
-      "Bash(pip install:*)"
+      "Bash(pip install:*)",
+      "PowerShell(python -c \"import ast,sys; tree=ast.parse\\(open\\(r'C:\\\\Users\\\\facun\\\\Escritorio\\\\sauron\\\\sauron.py',encoding='utf-8'\\).read\\(\\)\\); names=set\\(\\); [names.add\\(n.id\\) for n in ast.walk\\(tree\\) if isinstance\\(n,ast.Name\\)]; missing=[x for x in ['PoseLandmarker','LOTR_PHRASES','load_phrases','lm_visibility'] if x in names]; print\\('leftover refs:', missing if missing else 'none'\\)\")",
+      "PowerShell(Get-Content *)"
     ]
   }
 }
